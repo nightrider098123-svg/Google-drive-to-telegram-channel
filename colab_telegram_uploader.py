@@ -1037,10 +1037,11 @@ async def remove_duplicate_videos(app, channel_id, logs_folder):
                 await app.delete_messages(chat_id=channel_id, message_ids=messages_to_delete)
                 total_deleted += len(messages_to_delete)
                 messages_to_delete.clear()
-                await asyncio.sleep(2)
+                # Deletion can also be rate limited if done too frequently
+                await asyncio.sleep(3)
             except FloodWait as e:
                 print(f"FloodWait: Waiting for {e.value} seconds before continuing deletions...")
-                await asyncio.sleep(e.value)
+                await asyncio.sleep(e.value + 1)
                 # Retry once
                 await app.delete_messages(chat_id=channel_id, message_ids=messages_to_delete)
                 total_deleted += len(messages_to_delete)
@@ -1111,9 +1112,12 @@ async def remove_duplicate_videos(app, channel_id, logs_folder):
                     if new_highest_id: state["highest_scanned_id"] = new_highest_id
                     save_state()
 
+                # Throttle API requests to avoid FloodWait penalties
+                await asyncio.sleep(2.5)
+
             except FloodWait as e:
                 print(f"FloodWait: Waiting {e.value}s during get_messages...")
-                await asyncio.sleep(e.value)
+                await asyncio.sleep(e.value + 1)
             except Exception as e:
                 print(f"Error fetching recent messages batch {batch_start}-{batch_end}: {e}")
 
@@ -1173,9 +1177,12 @@ async def remove_duplicate_videos(app, channel_id, logs_folder):
                     state["lowest_scanned_id"] = 1 # Mark as fully processed
                     break
 
+                # Throttle API requests to avoid FloodWait penalties
+                await asyncio.sleep(2.5)
+
             except FloodWait as e:
                 print(f"FloodWait: Waiting {e.value}s during get_messages...")
-                await asyncio.sleep(e.value)
+                await asyncio.sleep(e.value + 1)
             except Exception as e:
                 print(f"Error fetching historical messages batch {batch_start}-{batch_end}: {e}")
 
