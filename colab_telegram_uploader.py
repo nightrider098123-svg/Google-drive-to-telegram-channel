@@ -950,7 +950,10 @@ async def remove_duplicate_videos(app, channel_id, logs_folder):
 
     seen_captions_path = os.path.join(logs_folder, "seen_captions.json")
     scan_state_path = os.path.join(logs_folder, "deduplication_state.json")
-    deleted_csv_path = os.path.join(logs_folder, "deleted_duplicates.csv")
+
+    # User requested the CSV file in the root directory of drive
+    drive_root = os.path.dirname(logs_folder) if "telegram_upload_logs" in logs_folder else get_drive_root(logs_folder)
+    deleted_csv_path = os.path.join(drive_root, "deleted_duplicates.csv")
 
     seen_captions = set()
     state = {
@@ -1011,18 +1014,20 @@ async def remove_duplicate_videos(app, channel_id, logs_folder):
     # Helper function to process a single message
     async def process_message(message, current_id):
         nonlocal messages_to_delete, seen_captions, deleted_csv_path
-        if message.video and message.caption:
+        if getattr(message, 'video', None) and getattr(message, 'caption', None):
             caption = message.caption.strip()
 
             if caption in seen_captions:
                 print(f"Found duplicate video with caption: '{caption}' (Message ID: {current_id})")
                 messages_to_delete.append(current_id)
 
+                # Real-time CSV updating as requested
                 try:
                     with open(deleted_csv_path, "a", encoding="utf-8") as f:
                         escaped_caption = caption.replace('"', '""')
                         timestamp = datetime.datetime.now().isoformat()
                         f.write(f'"{timestamp}",{current_id},"{escaped_caption}"\n')
+                        f.flush() # Force write to disk immediately
                 except Exception as e:
                     print(f"Warning: Could not write to deleted_duplicates.csv: {e}")
             else:
@@ -1081,12 +1086,16 @@ async def remove_duplicate_videos(app, channel_id, logs_folder):
     start_recent = highest_current_id
     end_recent = state["highest_scanned_id"]
 
-    if start_recent > end_recent:
-        # We process in batches of 100, going downwards
-        for batch_start in range(start_recent, end_recent, -100):
-            batch_end = max(end_recent, batch_start - 100)
+    # To avoid aggressive FloodWait, we will use an adaptive batch size and dynamic delay.
+    # Telegram strongly limits get_messages if it includes many missing/deleted IDs, or if
+    # requested too quickly.
+    current_batch_size = 40
+    current_delay = 3.0
 
-            # get_messages takes a list of IDs. We want to check them from highest to lowest in this chunk.
+    if start_recent > end_recent:
+        batch_start = start_recent
+        while batch_start > end_recent:
+            batch_end = max(end_recent, batch_start - current_batch_size)
             ids_to_fetch = list(range(batch_start, batch_end, -1))
 
             try:
@@ -1098,28 +1107,37 @@ async def remove_duplicate_videos(app, channel_id, logs_folder):
                     current_id = message.id
                     scanned_count += 1
 
-                    # If we don't have a lowest scanned ID yet (first run), keep tracking it
                     if state["lowest_scanned_id"] == 0 or current_id < state["lowest_scanned_id"]:
                         state["lowest_scanned_id"] = current_id
 
                     await process_message(message, current_id)
 
-                if len(messages_to_delete) >= 100:
+                if len(messages_to_delete) >= 50:
                     await flush_deletions()
 
-                if scanned_count % 500 == 0:
+                if scanned_count % 500 == 0 and scanned_count > 0:
                     print(f"Scanned {scanned_count} recent messages. Saving progress...")
                     if new_highest_id: state["highest_scanned_id"] = new_highest_id
                     save_state()
 
-                # Throttle API requests to avoid FloodWait penalties
-                await asyncio.sleep(2.5)
+                # Successful request, gradually decrease delay/increase batch if possible
+                current_delay = max(2.0, current_delay * 0.95)
+                current_batch_size = min(100, current_batch_size + 5)
+                await asyncio.sleep(current_delay)
+
+                batch_start = batch_end
 
             except FloodWait as e:
-                print(f"FloodWait: Waiting {e.value}s during get_messages...")
+                print(f"\nFloodWait triggered! Waiting {e.value}s before resuming...")
                 await asyncio.sleep(e.value + 1)
+                # Adaptive backoff: increase base delay, decrease batch size to avoid further limits
+                current_delay = min(10.0, current_delay * 1.5)
+                current_batch_size = max(10, int(current_batch_size * 0.5))
+                print(f"Adapting scanner: new batch_size={current_batch_size}, new_delay={current_delay:.2f}s")
+                # Do not advance batch_start, we will retry this batch in the next loop iteration
             except Exception as e:
                 print(f"Error fetching recent messages batch {batch_start}-{batch_end}: {e}")
+                batch_start = batch_end # Skip failing batch
 
     if new_highest_id:
         state["highest_scanned_id"] = new_highest_id
@@ -1135,8 +1153,9 @@ async def remove_duplicate_videos(app, channel_id, logs_folder):
         # We loop downwards until message ID 1
         empty_batches_count = 0
 
-        for batch_start in range(start_historical, 0, -100):
-            batch_end = max(0, batch_start - 100)
+        batch_start = start_historical
+        while batch_start > 0:
+            batch_end = max(0, batch_start - current_batch_size)
             ids_to_fetch = list(range(batch_start, batch_end, -1))
 
             try:
@@ -1151,7 +1170,6 @@ async def remove_duplicate_videos(app, channel_id, logs_folder):
                     current_id = message.id
                     scanned_count += 1
 
-                    # Keep pushing the lowest boundary down
                     if current_id < state["lowest_scanned_id"]:
                         state["lowest_scanned_id"] = current_id
 
@@ -1162,29 +1180,39 @@ async def remove_duplicate_videos(app, channel_id, logs_folder):
                 else:
                     empty_batches_count = 0 # reset on finding messages
 
-                if len(messages_to_delete) >= 100:
+                if len(messages_to_delete) >= 50:
                     await flush_deletions()
 
-                if scanned_count % 500 == 0:
+                if scanned_count % 500 == 0 and scanned_count > 0:
                     print(f"Scanned {scanned_count} total messages. Saving progress...")
                     save_state()
 
-                # If we've hit 5 consecutive batches (500 IDs) with no messages at all,
-                # we can safely assume we've reached the absolute beginning of the channel history.
-                if empty_batches_count >= 5:
+                # If we've hit consecutive empty batches (amounting to 500 IDs),
+                # we assume we've reached the absolute beginning of the channel history.
+                if empty_batches_count * current_batch_size >= 500:
                     print("Historical scan reached the absolute beginning of the channel (no more valid message IDs found)!")
                     state["historical_scan_done"] = True
                     state["lowest_scanned_id"] = 1 # Mark as fully processed
                     break
 
-                # Throttle API requests to avoid FloodWait penalties
-                await asyncio.sleep(2.5)
+                # Successful request, gradually decrease delay/increase batch if possible
+                current_delay = max(2.0, current_delay * 0.95)
+                current_batch_size = min(100, current_batch_size + 5)
+                await asyncio.sleep(current_delay)
+
+                batch_start = batch_end
 
             except FloodWait as e:
-                print(f"FloodWait: Waiting {e.value}s during get_messages...")
+                print(f"\nFloodWait triggered! Waiting {e.value}s before resuming...")
                 await asyncio.sleep(e.value + 1)
+                # Adaptive backoff: increase base delay, decrease batch size
+                current_delay = min(10.0, current_delay * 1.5)
+                current_batch_size = max(10, int(current_batch_size * 0.5))
+                print(f"Adapting scanner: new batch_size={current_batch_size}, new_delay={current_delay:.2f}s")
+                # Do not advance batch_start, retry next loop
             except Exception as e:
                 print(f"Error fetching historical messages batch {batch_start}-{batch_end}: {e}")
+                batch_start = batch_end # Skip failing batch
 
     await flush_deletions()
 
