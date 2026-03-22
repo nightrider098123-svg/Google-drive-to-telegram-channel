@@ -1093,7 +1093,7 @@ async def remove_duplicate_videos(app, channel_id, logs_folder):
 
     while not done:
         try:
-            messages = await app.get_chat_history(
+            messages = app.get_chat_history(
                 chat_id=channel_id,
                 limit=current_batch_size,
                 offset_id=offset_id
@@ -1168,7 +1168,7 @@ async def remove_duplicate_videos(app, channel_id, logs_folder):
 
         while offset_id > 0:
             try:
-                messages = await app.get_chat_history(
+                messages = app.get_chat_history(
                     chat_id=channel_id,
                     limit=current_batch_size,
                     offset_id=offset_id
