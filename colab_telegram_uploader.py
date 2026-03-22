@@ -1059,63 +1059,104 @@ async def remove_duplicate_videos(app, channel_id, logs_folder):
         except Exception as e:
             print(f"Warning: Could not save state: {e}")
 
-    # --- PASS 1: RECENT MESSAGES SCAN ---
-    print("\n[Pass 1] Scanning for recently uploaded messages...")
+    # Determine the absolute highest message ID currently in the channel.
+    # We do this by sending a temporary message and instantly deleting it,
+    # as bots cannot reliably fetch the 'latest' message via other means due to API limits.
+    print("Determining current highest message ID...")
+    highest_current_id = 0
     try:
-        new_highest_id = None
-        async for message in app.get_chat_history(chat_id=channel_id):
-            current_id = message.id
-            scanned_count += 1
-
-            # Record the absolute highest ID we've seen this run
-            if new_highest_id is None:
-                new_highest_id = current_id
-
-            # If we reach the highest ID from the previous run, we can stop the recent scan
-            if state["highest_scanned_id"] > 0 and current_id <= state["highest_scanned_id"]:
-                print(f"Reached previously scanned high watermark (ID {state['highest_scanned_id']}). Stopping recent scan.")
-                break
-
-            # If we don't have a lowest scanned ID yet (first run), keep tracking it
-            if state["lowest_scanned_id"] == 0 or current_id < state["lowest_scanned_id"]:
-                state["lowest_scanned_id"] = current_id
-
-            await process_message(message, current_id)
-
-            if len(messages_to_delete) >= 100:
-                await flush_deletions()
-
-            if scanned_count % 500 == 0:
-                print(f"Scanned {scanned_count} recent messages. Saving progress...")
-                if new_highest_id: state["highest_scanned_id"] = new_highest_id
-                save_state()
-
-        if new_highest_id:
-            state["highest_scanned_id"] = new_highest_id
-
+        temp_msg = await app.send_message(chat_id=channel_id, text="[Deduplication Sync]")
+        highest_current_id = temp_msg.id
+        await temp_msg.delete()
+        print(f"Highest current message ID is: {highest_current_id}")
     except Exception as e:
-        print(f"Error during recent scan: {e}")
+        print(f"Warning: Could not determine highest message ID. The bot might lack write permissions. Error: {e}")
+        return
+
+    # --- PASS 1: RECENT MESSAGES SCAN ---
+    print(f"\n[Pass 1] Scanning for recently uploaded messages (from {highest_current_id} down to {state['highest_scanned_id']})...")
+
+    new_highest_id = highest_current_id
+    start_recent = highest_current_id
+    end_recent = state["highest_scanned_id"]
+
+    if start_recent > end_recent:
+        # We process in batches of 100, going downwards
+        for batch_start in range(start_recent, end_recent, -100):
+            batch_end = max(end_recent, batch_start - 100)
+
+            # get_messages takes a list of IDs. We want to check them from highest to lowest in this chunk.
+            ids_to_fetch = list(range(batch_start, batch_end, -1))
+
+            try:
+                messages = await app.get_messages(chat_id=channel_id, message_ids=ids_to_fetch)
+                for message in messages:
+                    if not message or message.empty:
+                        continue
+
+                    current_id = message.id
+                    scanned_count += 1
+
+                    # If we don't have a lowest scanned ID yet (first run), keep tracking it
+                    if state["lowest_scanned_id"] == 0 or current_id < state["lowest_scanned_id"]:
+                        state["lowest_scanned_id"] = current_id
+
+                    await process_message(message, current_id)
+
+                if len(messages_to_delete) >= 100:
+                    await flush_deletions()
+
+                if scanned_count % 500 == 0:
+                    print(f"Scanned {scanned_count} recent messages. Saving progress...")
+                    if new_highest_id: state["highest_scanned_id"] = new_highest_id
+                    save_state()
+
+            except FloodWait as e:
+                print(f"FloodWait: Waiting {e.value}s during get_messages...")
+                await asyncio.sleep(e.value)
+            except Exception as e:
+                print(f"Error fetching recent messages batch {batch_start}-{batch_end}: {e}")
+
+    if new_highest_id:
+        state["highest_scanned_id"] = new_highest_id
 
     await flush_deletions()
 
     # --- PASS 2: HISTORICAL MESSAGES SCAN ---
     if not state["historical_scan_done"] and state["lowest_scanned_id"] > 0:
-        print(f"\n[Pass 2] Resuming historical scan from message ID {state['lowest_scanned_id']} downwards...")
-        try:
-            # Check if there are any messages left
-            reached_end = True
+        print(f"\n[Pass 2] Resuming historical scan from message ID {state['lowest_scanned_id']} downwards to 1...")
 
-            # offset_id gets messages strictly OLDER than lowest_scanned_id
-            async for message in app.get_chat_history(chat_id=channel_id, offset_id=state["lowest_scanned_id"]):
-                current_id = message.id
-                scanned_count += 1
-                reached_end = False # We found at least one older message
+        start_historical = state["lowest_scanned_id"] - 1
 
-                # Keep pushing the lowest boundary down
-                if current_id < state["lowest_scanned_id"]:
-                    state["lowest_scanned_id"] = current_id
+        # We loop downwards until message ID 1
+        empty_batches_count = 0
 
-                await process_message(message, current_id)
+        for batch_start in range(start_historical, 0, -100):
+            batch_end = max(0, batch_start - 100)
+            ids_to_fetch = list(range(batch_start, batch_end, -1))
+
+            try:
+                messages = await app.get_messages(chat_id=channel_id, message_ids=ids_to_fetch)
+
+                valid_messages_found = False
+                for message in messages:
+                    if not message or message.empty:
+                        continue
+
+                    valid_messages_found = True
+                    current_id = message.id
+                    scanned_count += 1
+
+                    # Keep pushing the lowest boundary down
+                    if current_id < state["lowest_scanned_id"]:
+                        state["lowest_scanned_id"] = current_id
+
+                    await process_message(message, current_id)
+
+                if not valid_messages_found:
+                    empty_batches_count += 1
+                else:
+                    empty_batches_count = 0 # reset on finding messages
 
                 if len(messages_to_delete) >= 100:
                     await flush_deletions()
@@ -1124,12 +1165,19 @@ async def remove_duplicate_videos(app, channel_id, logs_folder):
                     print(f"Scanned {scanned_count} total messages. Saving progress...")
                     save_state()
 
-            if reached_end:
-                print("Historical scan reached the beginning of the channel!")
-                state["historical_scan_done"] = True
+                # If we've hit 5 consecutive batches (500 IDs) with no messages at all,
+                # we can safely assume we've reached the absolute beginning of the channel history.
+                if empty_batches_count >= 5:
+                    print("Historical scan reached the absolute beginning of the channel (no more valid message IDs found)!")
+                    state["historical_scan_done"] = True
+                    state["lowest_scanned_id"] = 1 # Mark as fully processed
+                    break
 
-        except Exception as e:
-            print(f"Error during historical scan: {e}")
+            except FloodWait as e:
+                print(f"FloodWait: Waiting {e.value}s during get_messages...")
+                await asyncio.sleep(e.value)
+            except Exception as e:
+                print(f"Error fetching historical messages batch {batch_start}-{batch_end}: {e}")
 
     await flush_deletions()
 
