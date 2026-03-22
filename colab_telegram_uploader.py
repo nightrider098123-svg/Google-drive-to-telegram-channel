@@ -30,8 +30,9 @@ from typing import Optional, Tuple
 
 def append_error_log(filename: str, content: str) -> str:
     try:
-        os.makedirs("logs", exist_ok=True)
-        log_path = os.path.join("logs", "error_dump.txt")
+        drive_logs = os.path.join(get_drive_root(), "telegram_upload_logs")
+        os.makedirs(drive_logs, exist_ok=True)
+        log_path = os.path.join(drive_logs, "error_dump.txt")
         with open(log_path, 'a', encoding='utf-8') as f:
             f.write(f"--- Error dump for {filename} at {datetime.datetime.now().isoformat()} ---\n")
             f.write(content + '\n\n')
@@ -239,14 +240,15 @@ def append_log_tsv(logs_folder, filename, data):
 def append_log(line: str):
     """
     Opens the chosen log file in append mode and writes a newline-terminated line.
-    (Defaults to logs/upload_log.txt in the current directory, or a specific chosen path)
+    (Defaults to telegram_upload_logs/upload_log.txt in the drive root)
     """
     import time
     retries = 3
     for attempt in range(retries):
         try:
-            os.makedirs("logs", exist_ok=True)
-            log_path = os.path.join("logs", "upload_log.txt")
+            drive_logs = os.path.join(get_drive_root(), "telegram_upload_logs")
+            os.makedirs(drive_logs, exist_ok=True)
+            log_path = os.path.join(drive_logs, "upload_log.txt")
             with open(log_path, 'a', encoding='utf-8') as f:
                 f.write(line + '\n')
             break
@@ -287,38 +289,44 @@ def load_matched_pairs(logs_folder):
                 break
     return matched
 
+def get_drive_root(path=None):
+    """
+    Attempts to extract the Google Drive root path from a given path.
+    Typically on Colab this is /content/drive/MyDrive.
+    If no path is given, or if it doesn't match the typical Colab pattern,
+    it defaults to /content/drive/MyDrive if it exists, otherwise os.getcwd().
+    """
+    if path:
+        path = os.path.abspath(path)
+        if path.startswith('/content/drive/MyDrive'):
+            return '/content/drive/MyDrive'
+        elif path.startswith('/content/drive/Shareddrives'):
+            # For shared drives, the root is usually /content/drive/Shareddrives/<DriveName>
+            parts = path.split(os.sep)
+            if len(parts) >= 5:
+                return os.sep.join(parts[:5])
+            return '/content/drive/Shareddrives'
+        return os.path.dirname(path)
+
+    # Absolute fallback
+    if os.path.exists('/content/drive/MyDrive'):
+        return '/content/drive/MyDrive'
+    return os.getcwd()
+
 def get_session_path(args, fallback_path=None):
     """
     Returns the directory to save the Pyrogram user session file.
     Priority:
     1. --session_path argument if provided
     2. Google Drive root derived from fallback_path (a folder_path or upload_bulk path)
-    3. Current working directory as last resort
+    3. Absolute fallback to Google Drive Root (/content/drive/MyDrive)
     """
     if args.session_path:
         return args.session_path
     if fallback_path:
         drive_root = get_drive_root(fallback_path)
         return drive_root
-    return os.getcwd()
-
-def get_drive_root(path):
-    """
-    Attempts to extract the Google Drive root path from a given path.
-    Typically on Colab this is /content/drive/MyDrive.
-    If it doesn't match the typical Colab pattern, it returns the parent directory
-    of the given path as a fallback.
-    """
-    path = os.path.abspath(path)
-    if path.startswith('/content/drive/MyDrive'):
-        return '/content/drive/MyDrive'
-    elif path.startswith('/content/drive/Shareddrives'):
-        # For shared drives, the root is usually /content/drive/Shareddrives/<DriveName>
-        parts = path.split(os.sep)
-        if len(parts) >= 5:
-            return os.sep.join(parts[:5])
-        return '/content/drive/Shareddrives'
-    return os.path.dirname(path)
+    return get_drive_root()
 
 
 def prepare_thumbnail(thumb_path, temp_folder):
@@ -1290,8 +1298,8 @@ async def execute_deduplication_flow(args):
         elif args.upload_bulk:
             logs_folder = os.path.join(get_drive_root(args.upload_bulk[0]), "telegram_upload_logs")
         else:
-            # Fallback to local logs directory if no paths provided
-            logs_folder = "logs"
+            # Fallback to absolute Google Drive root
+            logs_folder = os.path.join(get_drive_root(), "telegram_upload_logs")
 
         os.makedirs(logs_folder, exist_ok=True)
 
