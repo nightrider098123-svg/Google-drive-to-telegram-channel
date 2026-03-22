@@ -287,6 +287,21 @@ def load_matched_pairs(logs_folder):
                 break
     return matched
 
+def get_session_path(args, fallback_path=None):
+    """
+    Returns the directory to save the Pyrogram user session file.
+    Priority:
+    1. --session_path argument if provided
+    2. Google Drive root derived from fallback_path (a folder_path or upload_bulk path)
+    3. Current working directory as last resort
+    """
+    if args.session_path:
+        return args.session_path
+    if fallback_path:
+        drive_root = get_drive_root(fallback_path)
+        return drive_root
+    return os.getcwd()
+
 def get_drive_root(path):
     """
     Attempts to extract the Google Drive root path from a given path.
@@ -431,6 +446,8 @@ def parse_args():
     # Deduplication Configuration
     parser.add_argument("--delete_duplicates", action="store_true",
                         help="Scan the channel history and delete older duplicate videos with exactly the same caption.")
+    parser.add_argument("--session_path", type=str, default=None,
+                        help="Directory where the Pyrogram user session file will be saved. Should be a Google Drive path to persist across Colab restarts, e.g. /content/drive/MyDrive")
 
     return parser.parse_args()
 
@@ -700,13 +717,11 @@ async def upload_files_async(args):
 
     print(f"\nFinished uploading {uploaded_count_ref[0]} files!")
 
-    # Run deduplication automatically
-    drive_root = get_drive_root(args.folder_path)
-    logs_folder = os.path.join(drive_root, "telegram_upload_logs")
-    os.makedirs(logs_folder, exist_ok=True)
-    await remove_duplicate_videos(app, args.channel_id, logs_folder)
-
+    # We must stop the bot client first before running deduplication with the user client
     await app.stop()
+
+    # Run deduplication automatically
+    await execute_deduplication_flow(args)
 
 async def upload_bulk_async(args, video_map, thumb_map, logs_folder, temp_folder):
     """
@@ -934,10 +949,11 @@ async def upload_bulk_async(args, video_map, thumb_map, logs_folder, temp_folder
 
     print(f"\nBulk upload finished!")
 
-    # Run deduplication automatically
-    await remove_duplicate_videos(app, args.channel_id, logs_folder)
-
+    # We must stop the bot client first before running deduplication with the user client
     await app.stop()
+
+    # Run deduplication automatically
+    await execute_deduplication_flow(args)
 
 async def remove_duplicate_videos(app, channel_id, logs_folder):
     """
@@ -1065,79 +1081,78 @@ async def remove_duplicate_videos(app, channel_id, logs_folder):
         except Exception as e:
             print(f"Warning: Could not save state: {e}")
 
-    # Determine the absolute highest message ID currently in the channel.
-    # We do this by sending a temporary message and instantly deleting it,
-    # as bots cannot reliably fetch the 'latest' message via other means due to API limits.
-    print("Determining current highest message ID...")
-    highest_current_id = 0
-    try:
-        temp_msg = await app.send_message(chat_id=channel_id, text="[Deduplication Sync]")
-        highest_current_id = temp_msg.id
-        await temp_msg.delete()
-        print(f"Highest current message ID is: {highest_current_id}")
-    except Exception as e:
-        print(f"Warning: Could not determine highest message ID. The bot might lack write permissions. Error: {e}")
-        return
-
     # --- PASS 1: RECENT MESSAGES SCAN ---
-    print(f"\n[Pass 1] Scanning for recently uploaded messages (from {highest_current_id} down to {state['highest_scanned_id']})...")
+    print(f"\n[Pass 1] Scanning for recently uploaded messages (down to {state['highest_scanned_id']})...")
 
-    new_highest_id = highest_current_id
-    start_recent = highest_current_id
+    current_batch_size = 100
+    current_delay = 1.0
+    offset_id = 0  # 0 = start from the absolute newest message
+    done = False
+    new_highest_id = None
     end_recent = state["highest_scanned_id"]
 
-    # To avoid aggressive FloodWait, we will use an adaptive batch size and dynamic delay.
-    # Telegram strongly limits get_messages if it includes many missing/deleted IDs, or if
-    # requested too quickly.
-    current_batch_size = 40
-    current_delay = 3.0
+    while not done:
+        try:
+            messages = await app.get_chat_history(
+                chat_id=channel_id,
+                limit=current_batch_size,
+                offset_id=offset_id
+            )
 
-    if start_recent > end_recent:
-        batch_start = start_recent
-        while batch_start > end_recent:
-            batch_end = max(end_recent, batch_start - current_batch_size)
-            ids_to_fetch = list(range(batch_start, batch_end, -1))
+            # Convert async generator to list for len check and processing
+            messages_list = []
+            async for m in messages:
+                messages_list.append(m)
 
-            try:
-                messages = await app.get_messages(chat_id=channel_id, message_ids=ids_to_fetch)
-                for message in messages:
-                    if not message or message.empty:
-                        continue
+            if not messages_list:
+                break
 
-                    current_id = message.id
-                    scanned_count += 1
+            last_id_in_batch = None
+            for message in messages_list:
+                if not message or message.empty:
+                    continue
 
-                    if state["lowest_scanned_id"] == 0 or current_id < state["lowest_scanned_id"]:
-                        state["lowest_scanned_id"] = current_id
+                current_id = message.id
 
-                    await process_message(message, current_id)
+                if new_highest_id is None:
+                    new_highest_id = current_id
 
-                if len(messages_to_delete) >= 50:
-                    await flush_deletions()
+                if current_id <= end_recent:
+                    done = True
+                    break
 
-                if scanned_count % 500 == 0 and scanned_count > 0:
-                    print(f"Scanned {scanned_count} recent messages. Saving progress...")
-                    if new_highest_id: state["highest_scanned_id"] = new_highest_id
-                    save_state()
+                scanned_count += 1
+                last_id_in_batch = current_id
 
-                # Successful request, gradually decrease delay/increase batch if possible
-                current_delay = max(2.0, current_delay * 0.95)
-                current_batch_size = min(100, current_batch_size + 5)
-                await asyncio.sleep(current_delay)
+                if state["lowest_scanned_id"] == 0 or current_id < state["lowest_scanned_id"]:
+                    state["lowest_scanned_id"] = current_id
 
-                batch_start = batch_end
+                await process_message(message, current_id)
 
-            except FloodWait as e:
-                print(f"\nFloodWait triggered! Waiting {e.value}s before resuming...")
-                await asyncio.sleep(e.value + 1)
-                # Adaptive backoff: increase base delay, decrease batch size to avoid further limits
-                current_delay = min(10.0, current_delay * 1.5)
-                current_batch_size = max(10, int(current_batch_size * 0.5))
-                print(f"Adapting scanner: new batch_size={current_batch_size}, new_delay={current_delay:.2f}s")
-                # Do not advance batch_start, we will retry this batch in the next loop iteration
-            except Exception as e:
-                print(f"Error fetching recent messages batch {batch_start}-{batch_end}: {e}")
-                batch_start = batch_end # Skip failing batch
+            if len(messages_to_delete) >= 50:
+                await flush_deletions()
+
+            if scanned_count % 500 == 0 and scanned_count > 0:
+                print(f"Scanned {scanned_count} recent messages. Saving progress...")
+                if new_highest_id: state["highest_scanned_id"] = new_highest_id
+                save_state()
+
+            if last_id_in_batch is None or done:
+                break
+
+            offset_id = last_id_in_batch
+            current_delay = max(0.5, current_delay * 0.95)
+            await asyncio.sleep(current_delay)
+
+        except FloodWait as e:
+            print(f"\nFloodWait triggered! Waiting {e.value}s before resuming...")
+            await asyncio.sleep(e.value + 1)
+            current_delay = min(5.0, current_delay * 1.5)
+            print(f"Adapting scanner: new_delay={current_delay:.2f}s")
+            # offset_id is not advanced, loop continues with same offset_id
+        except Exception as e:
+            print(f"Error fetching recent messages: {e}")
+            break
 
     if new_highest_id:
         state["highest_scanned_id"] = new_highest_id
@@ -1148,27 +1163,38 @@ async def remove_duplicate_videos(app, channel_id, logs_folder):
     if not state["historical_scan_done"] and state["lowest_scanned_id"] > 0:
         print(f"\n[Pass 2] Resuming historical scan from message ID {state['lowest_scanned_id']} downwards to 1...")
 
-        start_historical = state["lowest_scanned_id"] - 1
-
-        # We loop downwards until message ID 1
+        offset_id = state["lowest_scanned_id"]
         empty_batches_count = 0
 
-        batch_start = start_historical
-        while batch_start > 0:
-            batch_end = max(0, batch_start - current_batch_size)
-            ids_to_fetch = list(range(batch_start, batch_end, -1))
-
+        while offset_id > 0:
             try:
-                messages = await app.get_messages(chat_id=channel_id, message_ids=ids_to_fetch)
+                messages = await app.get_chat_history(
+                    chat_id=channel_id,
+                    limit=current_batch_size,
+                    offset_id=offset_id
+                )
+
+                # Convert async generator to list
+                messages_list = []
+                async for m in messages:
+                    messages_list.append(m)
+
+                if not messages_list:
+                    state["historical_scan_done"] = True
+                    state["lowest_scanned_id"] = 1
+                    break
 
                 valid_messages_found = False
-                for message in messages:
+                last_id_in_batch = None
+
+                for message in messages_list:
                     if not message or message.empty:
                         continue
 
                     valid_messages_found = True
                     current_id = message.id
                     scanned_count += 1
+                    last_id_in_batch = current_id
 
                     if current_id < state["lowest_scanned_id"]:
                         state["lowest_scanned_id"] = current_id
@@ -1178,7 +1204,12 @@ async def remove_duplicate_videos(app, channel_id, logs_folder):
                 if not valid_messages_found:
                     empty_batches_count += 1
                 else:
-                    empty_batches_count = 0 # reset on finding messages
+                    empty_batches_count = 0
+
+                if empty_batches_count >= 5:
+                    state["historical_scan_done"] = True
+                    state["lowest_scanned_id"] = 1
+                    break
 
                 if len(messages_to_delete) >= 50:
                     await flush_deletions()
@@ -1187,32 +1218,23 @@ async def remove_duplicate_videos(app, channel_id, logs_folder):
                     print(f"Scanned {scanned_count} total messages. Saving progress...")
                     save_state()
 
-                # If we've hit consecutive empty batches (amounting to 500 IDs),
-                # we assume we've reached the absolute beginning of the channel history.
-                if empty_batches_count * current_batch_size >= 500:
-                    print("Historical scan reached the absolute beginning of the channel (no more valid message IDs found)!")
-                    state["historical_scan_done"] = True
-                    state["lowest_scanned_id"] = 1 # Mark as fully processed
-                    break
+                if last_id_in_batch is None:
+                    offset_id = max(0, offset_id - current_batch_size)
+                else:
+                    offset_id = last_id_in_batch
 
-                # Successful request, gradually decrease delay/increase batch if possible
-                current_delay = max(2.0, current_delay * 0.95)
-                current_batch_size = min(100, current_batch_size + 5)
+                current_delay = max(0.5, current_delay * 0.95)
                 await asyncio.sleep(current_delay)
-
-                batch_start = batch_end
 
             except FloodWait as e:
                 print(f"\nFloodWait triggered! Waiting {e.value}s before resuming...")
                 await asyncio.sleep(e.value + 1)
-                # Adaptive backoff: increase base delay, decrease batch size
-                current_delay = min(10.0, current_delay * 1.5)
-                current_batch_size = max(10, int(current_batch_size * 0.5))
-                print(f"Adapting scanner: new batch_size={current_batch_size}, new_delay={current_delay:.2f}s")
-                # Do not advance batch_start, retry next loop
+                current_delay = min(5.0, current_delay * 1.5)
+                print(f"Adapting scanner: new_delay={current_delay:.2f}s")
+                # offset_id is not advanced, loop continues with same offset_id
             except Exception as e:
-                print(f"Error fetching historical messages batch {batch_start}-{batch_end}: {e}")
-                batch_start = batch_end # Skip failing batch
+                print(f"Error fetching historical messages: {e}")
+                break
 
     await flush_deletions()
 
@@ -1220,38 +1242,40 @@ async def remove_duplicate_videos(app, channel_id, logs_folder):
     save_state()
     print(f"--- Deduplication Complete: Scanned {scanned_count} messages this run, Deleted {total_deleted} duplicates. ---")
 
-async def run_deduplication_only(args):
+async def execute_deduplication_flow(args):
     """
-    Runs only the deduplication process without uploading any files.
+    Creates a User Pyrogram Client and runs the deduplication logic.
     """
+    fallback = args.folder_path or (args.upload_bulk[0] if args.upload_bulk else None)
+    session_dir = get_session_path(args, fallback_path=fallback)
+    os.makedirs(session_dir, exist_ok=True)
+    session_name = os.path.join(session_dir, "drive_uploader_user")
+
+    session_file = session_name + ".session"
+    if not os.path.exists(session_file):
+        print("="*60)
+        print("FIRST RUN: Pyrogram user authentication required.")
+        print("You will be prompted for your phone number and a")
+        print("verification code sent by Telegram.")
+        print(f"Session will be saved to: {session_file}")
+        print("This only happens once. Future runs will reuse this session.")
+        print("="*60)
+
     app = Client(
-        "drive_uploader_bot_dedup",
+        session_name,
         api_id=args.api_id,
-        api_hash=args.api_hash,
-        bot_token=args.bot_token,
-        in_memory=True
+        api_hash=args.api_hash
     )
 
     try:
         await app.start()
         print("Successfully connected to Telegram for deduplication.")
 
-        # Ping the channel using HTTP Bot API to cache the channel
-        print("Initializing channel cache via Bot API ping...")
-        url = f"https://api.telegram.org/bot{args.bot_token}/sendMessage?chat_id={args.channel_id}&text=Initializing+Deduplication+Cache..."
-        req = urllib.request.Request(url, method='POST')
-
         try:
-            res = urllib.request.urlopen(req)
-            data = json.loads(res.read())
-            msg_id = data['result']['message_id']
-            await asyncio.sleep(2)
-            url_del = f"https://api.telegram.org/bot{args.bot_token}/deleteMessage?chat_id={args.channel_id}&message_id={msg_id}"
-            urllib.request.urlopen(urllib.request.Request(url_del, method='POST'))
             chat = await app.get_chat(args.channel_id)
-            print(f"Successfully cached and resolved target channel: {chat.title}")
-        except urllib.error.HTTPError as e:
-            print(f"Error: The bot could not access the channel via HTTP API. Is the bot an admin? Error: {e.read().decode()}")
+            print(f"Successfully resolved target channel: {chat.title}")
+        except Exception as e:
+            print(f"Error: Could not access the channel. Are you a member? Error: {e}")
             await app.stop()
             return
 
@@ -1272,6 +1296,12 @@ async def run_deduplication_only(args):
         print(f"Error connecting to Telegram: {e}")
     finally:
         await app.stop()
+
+async def run_deduplication_only(args):
+    """
+    Runs only the deduplication process without uploading any files.
+    """
+    await execute_deduplication_flow(args)
 
 def main():
     args = parse_args()
