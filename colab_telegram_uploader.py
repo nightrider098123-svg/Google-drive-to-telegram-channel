@@ -1272,11 +1272,16 @@ async def execute_deduplication_flow(args):
         print("Successfully connected to Telegram for deduplication.")
 
         try:
+            # Sync user dialogs to cache peers into the local database
+            print("Syncing user dialogs to populate peer cache...")
+            async for _ in app.get_dialogs(limit=50):
+                pass
+
             chat = await app.get_chat(args.channel_id)
             print(f"Successfully resolved target channel: {chat.title}")
         except Exception as e:
             print(f"Error: Could not access the channel. Are you a member? Error: {e}")
-            await app.stop()
+            # Do NOT call await app.stop() here as the finally block handles it safely.
             return
 
         logs_folder = None
