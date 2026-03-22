@@ -11,6 +11,7 @@ By utilizing the [Pyrogram](https://docs.pyrogram.org/) library (an MTProto fram
 * **Automatic Captions:** The filename (without the extension) is automatically applied as the caption for every uploaded file.
 * **Smart Tracking (No Duplicates):** The script maintains a tiny `uploaded_files_tracker.txt` file inside your target folder. If the script is stopped and restarted later, it will only upload new files.
 * **Media Filtering:** Choose to upload only `photos`, only `videos`, `both`, or `all` files in the folder.
+* **Automatic Channel Deduplication:** Scans the destination channel to find and delete older duplicate videos that have the same caption. Maintains state so it's fully resumable and logs all deletions to a CSV file.
 
 ## How the "No Duplicate Uploads" System Works
 
@@ -74,6 +75,7 @@ Run the script in a Colab cell using the `!` prefix:
 | `--media_type` | `all` | Filter what to send. Choices: `photos`, `videos`, `both`, `all`. |
 | `--limit` | `0` (Unlimited) | Maximum number of files to upload in a single execution. |
 | `--workers` | `3` | How many files to upload parallelly/concurrently. Set to `1` if you want a clean progress bar. |
+| `--delete_duplicates` | `False` | Add this flag to perform a deduplication scan on the target channel to find and remove older duplicate videos with exactly the same caption. Logs deletions to a CSV file. If used alone without a target path, it performs *only* the deduplication. |
 
 ## Examples
 
@@ -136,3 +138,15 @@ If you have a folder full of videos and a separate folder full of their respecti
   --channel_id -1009876543210 \
   --upload_bulk "/content/drive/MyDrive/Series/Videos" "/content/drive/MyDrive/Series/Thumbs"
 ```
+
+### 6. Scan and Delete Duplicate Videos
+If you want to manually trigger the deduplication feature to scan the target channel for videos with duplicate captions (keeping the newest ones and deleting older ones) and log the deletions to a CSV without uploading anything:
+```bash
+!python colab_telegram_uploader.py \
+  --api_id 1234567 \
+  --api_hash abcdef1234567890 \
+  --bot_token 123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11 \
+  --channel_id -1009876543210 \
+  --delete_duplicates
+```
+*(The deduplicator will save its progress to a `deduplication_state.json` file and a `seen_captions.json` file in a `logs` folder. You can safely interrupt the script and it will resume from where it left off next time! The deleted messages will be logged in `deleted_duplicates.csv`)*

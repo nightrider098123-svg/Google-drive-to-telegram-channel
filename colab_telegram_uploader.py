@@ -428,6 +428,10 @@ def parse_args():
     parser.add_argument("--workers", type=int, default=3,
                         help="Number of files to upload concurrently. Default is 3.")
 
+    # Deduplication Configuration
+    parser.add_argument("--delete_duplicates", action="store_true",
+                        help="Scan the channel history and delete older duplicate videos with exactly the same caption.")
+
     return parser.parse_args()
 
 def is_matching_media_type(filename, filter_type):
@@ -694,8 +698,15 @@ async def upload_files_async(args):
     for w in workers:
         w.cancel()
 
-    await app.stop()
     print(f"\nFinished uploading {uploaded_count_ref[0]} files!")
+
+    # Run deduplication automatically
+    drive_root = get_drive_root(args.folder_path)
+    logs_folder = os.path.join(drive_root, "telegram_upload_logs")
+    os.makedirs(logs_folder, exist_ok=True)
+    await remove_duplicate_videos(app, args.channel_id, logs_folder)
+
+    await app.stop()
 
 async def upload_bulk_async(args, video_map, thumb_map, logs_folder, temp_folder):
     """
@@ -921,11 +932,271 @@ async def upload_bulk_async(args, video_map, thumb_map, logs_folder, temp_folder
             for path in thumb_paths:
                 append_log_tsv(logs_folder, "unmatched_thumbs.txt", [timestamp, path])
 
-    await app.stop()
     print(f"\nBulk upload finished!")
+
+    # Run deduplication automatically
+    await remove_duplicate_videos(app, args.channel_id, logs_folder)
+
+    await app.stop()
+
+async def remove_duplicate_videos(app, channel_id, logs_folder):
+    """
+    Scans the channel history to find and delete duplicate videos based on their exact captions.
+    It performs a comprehensive scan by always checking newest messages (for continuous uploads)
+    and continuing historical scans where it left off, avoiding redundant checks.
+    Deletions are logged in a CSV file.
+    """
+    print("\n--- Starting Deduplication Scan ---")
+
+    seen_captions_path = os.path.join(logs_folder, "seen_captions.json")
+    scan_state_path = os.path.join(logs_folder, "deduplication_state.json")
+    deleted_csv_path = os.path.join(logs_folder, "deleted_duplicates.csv")
+
+    seen_captions = set()
+    state = {
+        "highest_scanned_id": 0,    # The ID of the very first message we successfully checked (newest)
+        "lowest_scanned_id": 0,     # The ID of the oldest message we successfully checked
+        "historical_scan_done": False # Whether we have reached the very beginning of the channel history
+    }
+
+    # Load previously seen captions
+    if os.path.exists(seen_captions_path):
+        try:
+            with open(seen_captions_path, "r", encoding="utf-8") as f:
+                seen_captions = set(json.load(f))
+            print(f"Loaded {len(seen_captions)} previously seen captions.")
+        except Exception as e:
+            print(f"Warning: Could not load seen_captions.json: {e}")
+
+    # Load scan state
+    if os.path.exists(scan_state_path):
+        try:
+            with open(scan_state_path, "r", encoding="utf-8") as f:
+                loaded_state = json.load(f)
+                state.update(loaded_state)
+            print(f"Loaded deduplication state: {state}")
+        except Exception as e:
+            print(f"Warning: Could not load deduplication_state.json: {e}")
+
+    # Legacy migration: If old last_scanned_message_id.txt exists, migrate it
+    legacy_id_path = os.path.join(logs_folder, "last_scanned_message_id.txt")
+    if os.path.exists(legacy_id_path) and state["lowest_scanned_id"] == 0:
+        try:
+            with open(legacy_id_path, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+                if content.isdigit():
+                    state["lowest_scanned_id"] = int(content)
+                    print(f"Migrated legacy scan ID: {state['lowest_scanned_id']}")
+        except Exception as e:
+            pass
+
+    # Create CSV header if it doesn't exist
+    if not os.path.exists(deleted_csv_path):
+        try:
+            with open(deleted_csv_path, "w", encoding="utf-8") as f:
+                f.write("Timestamp,MessageID,Caption\n")
+        except Exception as e:
+            print(f"Warning: Could not create deleted_duplicates.csv: {e}")
+
+    messages_to_delete = []
+    total_deleted = 0
+    scanned_count = 0
+
+    # We will do two passes if needed:
+    # Pass 1: "Recent Scan". Scan from the absolute newest message downwards, until we hit
+    # the highest_scanned_id from the *previous* run. This covers new uploads.
+    # Pass 2: "Historical Scan". If the historical scan hasn't reached the beginning of the
+    # channel yet, resume it from lowest_scanned_id downwards.
+
+    # Helper function to process a single message
+    async def process_message(message, current_id):
+        nonlocal messages_to_delete, seen_captions, deleted_csv_path
+        if message.video and message.caption:
+            caption = message.caption.strip()
+
+            if caption in seen_captions:
+                print(f"Found duplicate video with caption: '{caption}' (Message ID: {current_id})")
+                messages_to_delete.append(current_id)
+
+                try:
+                    with open(deleted_csv_path, "a", encoding="utf-8") as f:
+                        escaped_caption = caption.replace('"', '""')
+                        timestamp = datetime.datetime.now().isoformat()
+                        f.write(f'"{timestamp}",{current_id},"{escaped_caption}"\n')
+                except Exception as e:
+                    print(f"Warning: Could not write to deleted_duplicates.csv: {e}")
+            else:
+                seen_captions.add(caption)
+
+    # Helper function to flush batch deletions
+    async def flush_deletions():
+        nonlocal messages_to_delete, total_deleted
+        if messages_to_delete:
+            print(f"Deleting batch of {len(messages_to_delete)} duplicate messages...")
+            try:
+                await app.delete_messages(chat_id=channel_id, message_ids=messages_to_delete)
+                total_deleted += len(messages_to_delete)
+                messages_to_delete.clear()
+                await asyncio.sleep(2)
+            except FloodWait as e:
+                print(f"FloodWait: Waiting for {e.value} seconds before continuing deletions...")
+                await asyncio.sleep(e.value)
+                # Retry once
+                await app.delete_messages(chat_id=channel_id, message_ids=messages_to_delete)
+                total_deleted += len(messages_to_delete)
+                messages_to_delete.clear()
+            except Exception as e:
+                print(f"Error deleting batch: {e}")
+                messages_to_delete.clear()
+
+    # Helper function to save state
+    def save_state():
+        try:
+            with open(seen_captions_path, "w", encoding="utf-8") as f:
+                json.dump(list(seen_captions), f)
+            with open(scan_state_path, "w", encoding="utf-8") as f:
+                json.dump(state, f)
+        except Exception as e:
+            print(f"Warning: Could not save state: {e}")
+
+    # --- PASS 1: RECENT MESSAGES SCAN ---
+    print("\n[Pass 1] Scanning for recently uploaded messages...")
+    try:
+        new_highest_id = None
+        async for message in app.get_chat_history(chat_id=channel_id):
+            current_id = message.id
+            scanned_count += 1
+
+            # Record the absolute highest ID we've seen this run
+            if new_highest_id is None:
+                new_highest_id = current_id
+
+            # If we reach the highest ID from the previous run, we can stop the recent scan
+            if state["highest_scanned_id"] > 0 and current_id <= state["highest_scanned_id"]:
+                print(f"Reached previously scanned high watermark (ID {state['highest_scanned_id']}). Stopping recent scan.")
+                break
+
+            # If we don't have a lowest scanned ID yet (first run), keep tracking it
+            if state["lowest_scanned_id"] == 0 or current_id < state["lowest_scanned_id"]:
+                state["lowest_scanned_id"] = current_id
+
+            await process_message(message, current_id)
+
+            if len(messages_to_delete) >= 100:
+                await flush_deletions()
+
+            if scanned_count % 500 == 0:
+                print(f"Scanned {scanned_count} recent messages. Saving progress...")
+                if new_highest_id: state["highest_scanned_id"] = new_highest_id
+                save_state()
+
+        if new_highest_id:
+            state["highest_scanned_id"] = new_highest_id
+
+    except Exception as e:
+        print(f"Error during recent scan: {e}")
+
+    await flush_deletions()
+
+    # --- PASS 2: HISTORICAL MESSAGES SCAN ---
+    if not state["historical_scan_done"] and state["lowest_scanned_id"] > 0:
+        print(f"\n[Pass 2] Resuming historical scan from message ID {state['lowest_scanned_id']} downwards...")
+        try:
+            # Check if there are any messages left
+            reached_end = True
+
+            # offset_id gets messages strictly OLDER than lowest_scanned_id
+            async for message in app.get_chat_history(chat_id=channel_id, offset_id=state["lowest_scanned_id"]):
+                current_id = message.id
+                scanned_count += 1
+                reached_end = False # We found at least one older message
+
+                # Keep pushing the lowest boundary down
+                if current_id < state["lowest_scanned_id"]:
+                    state["lowest_scanned_id"] = current_id
+
+                await process_message(message, current_id)
+
+                if len(messages_to_delete) >= 100:
+                    await flush_deletions()
+
+                if scanned_count % 500 == 0:
+                    print(f"Scanned {scanned_count} total messages. Saving progress...")
+                    save_state()
+
+            if reached_end:
+                print("Historical scan reached the beginning of the channel!")
+                state["historical_scan_done"] = True
+
+        except Exception as e:
+            print(f"Error during historical scan: {e}")
+
+    await flush_deletions()
+
+    print("\nSaving final deduplication state...")
+    save_state()
+    print(f"--- Deduplication Complete: Scanned {scanned_count} messages this run, Deleted {total_deleted} duplicates. ---")
+
+async def run_deduplication_only(args):
+    """
+    Runs only the deduplication process without uploading any files.
+    """
+    app = Client(
+        "drive_uploader_bot_dedup",
+        api_id=args.api_id,
+        api_hash=args.api_hash,
+        bot_token=args.bot_token,
+        in_memory=True
+    )
+
+    try:
+        await app.start()
+        print("Successfully connected to Telegram for deduplication.")
+
+        # Ping the channel using HTTP Bot API to cache the channel
+        print("Initializing channel cache via Bot API ping...")
+        url = f"https://api.telegram.org/bot{args.bot_token}/sendMessage?chat_id={args.channel_id}&text=Initializing+Deduplication+Cache..."
+        req = urllib.request.Request(url, method='POST')
+
+        try:
+            res = urllib.request.urlopen(req)
+            data = json.loads(res.read())
+            msg_id = data['result']['message_id']
+            await asyncio.sleep(2)
+            url_del = f"https://api.telegram.org/bot{args.bot_token}/deleteMessage?chat_id={args.channel_id}&message_id={msg_id}"
+            urllib.request.urlopen(urllib.request.Request(url_del, method='POST'))
+            chat = await app.get_chat(args.channel_id)
+            print(f"Successfully cached and resolved target channel: {chat.title}")
+        except urllib.error.HTTPError as e:
+            print(f"Error: The bot could not access the channel via HTTP API. Is the bot an admin? Error: {e.read().decode()}")
+            await app.stop()
+            return
+
+        logs_folder = None
+        if args.folder_path:
+            logs_folder = os.path.join(get_drive_root(args.folder_path), "telegram_upload_logs")
+        elif args.upload_bulk:
+            logs_folder = os.path.join(get_drive_root(args.upload_bulk[0]), "telegram_upload_logs")
+        else:
+            # Fallback to local logs directory if no paths provided
+            logs_folder = "logs"
+
+        os.makedirs(logs_folder, exist_ok=True)
+
+        await remove_duplicate_videos(app, args.channel_id, logs_folder)
+
+    except Exception as e:
+        print(f"Error connecting to Telegram: {e}")
+    finally:
+        await app.stop()
 
 def main():
     args = parse_args()
+
+    # Check if only deduplication should run
+    if args.delete_duplicates and not args.folder_path and not args.upload_bulk:
+        asyncio.run(run_deduplication_only(args))
+        return
 
     if args.upload_bulk:
         video_folder, thumb_folder = args.upload_bulk
