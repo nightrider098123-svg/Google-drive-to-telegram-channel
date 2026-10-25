@@ -454,6 +454,8 @@ def parse_args():
     # Deduplication Configuration
     parser.add_argument("--delete_duplicates", action="store_true",
                         help="Scan the channel history and delete older duplicate videos with exactly the same caption.")
+    parser.add_argument("--disable_automatic_thumbnails", action="store_true",
+                        help="Disable automatic thumbnail generation and uploading.")
     parser.add_argument("--session_path", type=str, default=None,
                         help="Directory where the Pyrogram user session file will be saved. Should be a Google Drive path to persist across Colab restarts, e.g. /content/drive/MyDrive")
 
@@ -491,7 +493,15 @@ async def upload_worker(app, queue, args, tracker_file, uploaded_files, uploaded
             break
 
         file_path = os.path.join(args.folder_path, filename)
-        caption = clean_caption(os.path.splitext(filename)[0])
+
+        # Format the caption based on relative path parts
+        path_parts = filename.split(os.sep)
+        # Drop the extension for the final filename part
+        path_parts[-1] = os.path.splitext(path_parts[-1])[0]
+
+        # Clean each part and join with hyphens
+        cleaned_parts = [clean_caption(p) for p in path_parts if p]
+        caption = " - ".join(cleaned_parts)
 
         # Define a closure for progress so it doesn't garble output from other workers
         # We only print progress if there's a single worker to prevent messy logs
@@ -512,11 +522,21 @@ async def upload_worker(app, queue, args, tracker_file, uploaded_files, uploaded
                 is_photo = mime_type and mime_type.startswith('image/')
 
                 msg = None
+                final_thumb_path = None
+
+                if is_video and not getattr(args, 'disable_automatic_thumbnails', False):
+                    drive_root = get_drive_root(file_path)
+                    temp_folder = os.path.join(drive_root, "temp_upload_processing")
+                    os.makedirs(temp_folder, exist_ok=True)
+                    loop = asyncio.get_event_loop()
+                    final_thumb_path = await loop.run_in_executor(None, generate_fallback_thumbnail, file_path, temp_folder)
+
                 if is_video:
                     msg = await app.send_video(
                         chat_id=args.channel_id,
                         video=file_path,
                         caption=caption,
+                        thumb=final_thumb_path,
                         progress=prog_cb
                     )
 
@@ -532,6 +552,7 @@ async def upload_worker(app, queue, args, tracker_file, uploaded_files, uploaded
                                 chat_id=args.channel_id,
                                 video=file_path,
                                 caption=caption,
+                                thumb=final_thumb_path,
                                 duration=int(dur),
                                 progress=prog_cb
                             )
@@ -548,6 +569,7 @@ async def upload_worker(app, queue, args, tracker_file, uploaded_files, uploaded
                                         chat_id=args.channel_id,
                                         video=remuxed_path,
                                         caption=caption,
+                                        thumb=final_thumb_path,
                                         duration=int(dur_remux),
                                         progress=prog_cb
                                     )
@@ -592,6 +614,14 @@ async def upload_worker(app, queue, args, tracker_file, uploaded_files, uploaded
 
                 print(f"\nSuccessfully uploaded: {filename}")
                 await asyncio.sleep(3) # Hardcoded 3-second sleep between files
+
+                # Cleanup temp thumbnail
+                if final_thumb_path and os.path.exists(final_thumb_path):
+                    try:
+                        os.remove(final_thumb_path)
+                    except Exception as e:
+                        print(f"Failed to clean up temp file {final_thumb_path}: {e}")
+
                 break # Success! Break out of the while loop
 
             except FloodWait as e:
@@ -600,6 +630,12 @@ async def upload_worker(app, queue, args, tracker_file, uploaded_files, uploaded
                 continue # Retry from the top
             except Exception as e:
                 print(f"\nFailed to upload {filename}. Error: {e}")
+                # Cleanup temp thumbnail on error
+                if 'final_thumb_path' in locals() and final_thumb_path and os.path.exists(final_thumb_path):
+                    try:
+                        os.remove(final_thumb_path)
+                    except Exception as e:
+                        pass
                 break # Stop retrying for this file on other errors
 
         queue.task_done()
@@ -622,29 +658,28 @@ async def upload_files_async(args):
     uploaded_files = load_uploaded_files(tracker_file)
     print(f"Loaded {len(uploaded_files)} already uploaded files from tracker.")
 
-    # Scan directory
+    # Scan directory recursively
+    files_to_upload = []
     try:
-        all_files = sorted(os.listdir(args.folder_path))
+        for root, _, files in os.walk(args.folder_path):
+            for f in sorted(files):
+                if f == TRACKER_FILE_NAME:
+                    continue
+
+                file_path = os.path.join(root, f)
+                # Compute relative path
+                rel_path = os.path.relpath(file_path, args.folder_path)
+
+                if rel_path in uploaded_files:
+                    continue
+
+                if not is_matching_media_type(f, args.media_type):
+                    continue
+
+                files_to_upload.append(rel_path)
     except Exception as e:
         print(f"Error reading directory {args.folder_path}: {e}")
         return
-
-    files_to_upload = []
-    for f in all_files:
-        if f == TRACKER_FILE_NAME:
-            continue
-
-        file_path = os.path.join(args.folder_path, f)
-        if not os.path.isfile(file_path):
-            continue
-
-        if f in uploaded_files:
-            continue
-
-        if not is_matching_media_type(f, args.media_type):
-            continue
-
-        files_to_upload.append(f)
 
     print(f"Found {len(files_to_upload)} new files matching filter '{args.media_type}'.")
 
@@ -819,23 +854,24 @@ async def upload_bulk_async(args, video_map, thumb_map, logs_folder, temp_folder
         final_thumb_path = None
         loop = asyncio.get_event_loop()
 
-        if thumb_path:
-            final_thumb_path = await loop.run_in_executor(None, prepare_thumbnail, thumb_path, temp_folder)
-            if not final_thumb_path:
-                print(f"Failed to normalize thumbnail for {basename}, proceeding without it.")
-                append_log_tsv(logs_folder, "failed_uploads.txt", [timestamp, video_path, f"Thumbnail normalization failed for {thumb_path}"])
-        else:
-            print(f"No thumbnail found for {basename}. Appending to unmatched_videos.txt and attempting fallback generation.")
-            append_log_tsv(logs_folder, "unmatched_videos.txt", [timestamp, video_path])
-            final_thumb_path = await loop.run_in_executor(None, generate_fallback_thumbnail, video_path, temp_folder)
-            if not final_thumb_path:
-                print(f"Fallback generation failed for {basename}. Proceeding without thumbnail.")
+        if not getattr(args, 'disable_automatic_thumbnails', False):
+            if thumb_path:
+                final_thumb_path = await loop.run_in_executor(None, prepare_thumbnail, thumb_path, temp_folder)
+                if not final_thumb_path:
+                    print(f"Failed to normalize thumbnail for {basename}, proceeding without it.")
+                    append_log_tsv(logs_folder, "failed_uploads.txt", [timestamp, video_path, f"Thumbnail normalization failed for {thumb_path}"])
+            else:
+                print(f"No thumbnail found for {basename}. Appending to unmatched_videos.txt and attempting fallback generation.")
+                append_log_tsv(logs_folder, "unmatched_videos.txt", [timestamp, video_path])
+                final_thumb_path = await loop.run_in_executor(None, generate_fallback_thumbnail, video_path, temp_folder)
+                if not final_thumb_path:
+                    print(f"Fallback generation failed for {basename}. Proceeding without thumbnail.")
 
-        # Also check for unmatched thumbnails just for logging purposes
-        if thumb_path and not video_map.get(basename):
-            # This condition is conceptually here if we iterated thumb_map instead,
-            # but since we iterate video_map, we'll do a quick secondary pass for unmatched thumbs.
-            pass
+            # Also check for unmatched thumbnails just for logging purposes
+            if thumb_path and not video_map.get(basename):
+                # This condition is conceptually here if we iterated thumb_map instead,
+                # but since we iterate video_map, we'll do a quick secondary pass for unmatched thumbs.
+                pass
 
         # 3. Uploading
         caption = clean_caption(basename)
@@ -861,7 +897,10 @@ async def upload_bulk_async(args, video_map, thumb_map, logs_folder, temp_folder
                         dur, err_str = probe_duration_with_err(video_path)
 
                         # Prepare thumbnail specifically for resend as per requirements
-                        resend_thumb = prepare_thumbnail_if_needed(thumb_path) if thumb_path else final_thumb_path
+                        if getattr(args, 'disable_automatic_thumbnails', False):
+                            resend_thumb = None
+                        else:
+                            resend_thumb = prepare_thumbnail_if_needed(thumb_path) if thumb_path else final_thumb_path
 
                         if dur and dur > 0:
                             print(f"ffprobe returned duration {dur}s. Re-sending...")
